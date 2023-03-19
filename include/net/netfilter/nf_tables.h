@@ -984,6 +984,13 @@ struct nft_expr_ops {
 	void				*data;
 };
 
+#ifdef CONFIG_SAL_GENERAL
+//struct to store the results of the bytecode analysis
+struct nft_ra_info{
+	u32 range[5][2];
+	u64 priority;
+};
+#endif
 /**
  *	struct nft_rule - nf_tables rule
  *
@@ -996,6 +1003,12 @@ struct nft_expr_ops {
  */
 struct nft_rule {
 	struct list_head		list;
+#ifdef CONFIG_SAL_MEMLESS_HELPER_STRUCT
+	struct nft_ra_info cmp_data;
+#endif
+#ifdef CONFIG_SAL_GENERAL
+    u32             priority;
+#endif
 	u64				handle:42,
 					genmask:2,
 					dlen:12,
@@ -1102,6 +1115,19 @@ struct nft_chain {
 
 	/* Only used during control plane commit phase: */
 	struct nft_rule			**rules_next;
+
+#ifdef CONFIG_SAL_DEBUG
+	atomic64_t 	traversed_rules;
+    atomic64_t    proc_pkts;
+    atomic_t    swaps;
+    atomic64_t    expr;
+#endif
+#ifdef CONFIG_SAL_LOCKING_ENABLE
+	spinlock_t rules_lock;
+#endif
+#ifdef CONFIG_SAL_GENERAL
+    u32 hook_num;
+#endif
 };
 
 int nft_chain_validate(const struct nft_ctx *ctx, const struct nft_chain *chain);
@@ -1480,6 +1506,14 @@ struct nft_traceinfo {
 	enum nft_trace_types		type;
 	bool				packet_dumped;
 	bool				trace;
+#ifdef CONFIG_SAL_DEBUG
+    //enabled - this is used for the bpf observer to indicate that this struct contains data that needs to be observed
+    bool enabled;
+    unsigned int swaps;
+    unsigned int trav_nodes;
+    unsigned int rule_handle;
+    unsigned int cpu;
+#endif
 };
 
 void nft_trace_init(struct nft_traceinfo *info, const struct nft_pktinfo *pkt,
@@ -1922,5 +1956,19 @@ static inline bool nft_reg_track_cmp(struct nft_regs_track *track,
 	       track->regs[dreg].selector->ops == expr->ops &&
 	       track->regs[dreg].num_reg == 0;
 }
+#ifdef CONFIG_SAL_GENERAL
+
+struct nft_my_work_data{
+	struct work_struct my_work;
+	struct nft_chain *chain;
+	struct nft_rule *rule;
+	bool genbit;
+};
+
+
+//compare section
+int rule_compare(struct list_head *prev, struct list_head *matched);
+void nft_construct_rule_data(struct nft_ra_info *data,struct nft_rule *rule);
+#endif
 
 #endif /* _NET_NF_TABLES_H */

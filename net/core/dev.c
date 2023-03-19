@@ -12985,6 +12985,7 @@ static struct smp_hotplug_thread backlog_threads = {
  */
 static int __init net_dev_init(void)
 {
+    int hook;
 	int i, rc = -ENOMEM;
 
 	BUG_ON(!dev_boot_phase);
@@ -13034,6 +13035,13 @@ static int __init net_dev_init(void)
 
 		if (net_page_pool_create(i))
 			goto out;
+
+#ifdef CONFIG_SAL_GENERAL
+        pr_info("MAX_HOOKS: %d\n", NF_MAX_HOOKS);
+        for(hook=0; hook < NF_MAX_HOOKS; ++hook){
+            sd->rules[hook] = NULL;
+        }
+#endif
 	}
 	net_hotdata.skb_defer_nodes =
 		 __alloc_percpu(sizeof(struct skb_defer_node) * nr_node_ids,

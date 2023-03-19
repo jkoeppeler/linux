@@ -91,7 +91,8 @@ nf_tables-objs := nf_tables_core.o nf_tables_api.o nft_chain_filter.o \
 		  nft_counter.o nft_objref.o nft_inner.o \
 		  nft_chain_route.o nf_tables_offload.o \
 		  nft_set_hash.o nft_set_bitmap.o nft_set_rbtree.o \
-		  nft_set_pipapo.o
+		  nft_set_pipapo.o \
+		  nf_tables_rule_compare.o
 
 ifdef CONFIG_X86_64
 ifndef CONFIG_UML

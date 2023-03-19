@@ -3533,6 +3533,10 @@ struct softnet_data {
 #endif
 	struct sk_buff_head	input_pkt_queue;
 	struct napi_struct	backlog;
+#ifdef CONFIG_SAL_GENERAL
+    //One rule ** for every hook
+    struct nft_rule *__rcu *rules[NF_MAX_HOOKS];
+#endif
 
 	struct numa_drop_counters drop_counters;
 

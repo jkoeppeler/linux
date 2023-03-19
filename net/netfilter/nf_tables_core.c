@@ -21,9 +21,31 @@
 #include <net/netfilter/nf_log.h>
 #include <net/netfilter/nft_meta.h>
 
+#ifdef CONFIG_SAL_GENERAL
+#include <linux/list_mrf_extension.h>
+DEFINE_PER_CPU(struct per_cpu_rules_t, per_cpu_rules);
+EXPORT_PER_CPU_SYMBOL(per_cpu_rules);
+
+static struct kobject *mrf_nft_kobj;
+static unsigned int mrf_enable;
+
+static ssize_t mrf_enable_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "enabled: %d\n", mrf_enable);
+}
+
+static ssize_t mrf_enable_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	sscanf(buf, "%du", &mrf_enable);
+	return count;
+}
+static struct kobj_attribute mrf_enable_attr = __ATTR(mrf_enable, 0660, mrf_enable_show, mrf_enable_store);
+#endif
+
 #if defined(CONFIG_MITIGATION_RETPOLINE) && defined(CONFIG_X86)
 
 static struct static_key_false nf_tables_skip_direct_calls;
+
 
 static bool nf_skip_indirect_calls(void)
 {
@@ -61,6 +83,10 @@ static inline void nft_trace_packet(struct nft_traceinfo *info,
 				    const struct nft_rule *rule,
 				    enum nft_trace_types type)
 {
+#ifdef CONFIG_SAL_DEBUG
+    if(info->enabled)
+        info->enabled = false;
+#endif
 	if (static_branch_unlikely(&nft_trace_enabled)) {
 		info->rule = rule;
 		__nft_trace_packet(info, chain, type);
@@ -77,8 +103,13 @@ static void nft_bitwise_fast_eval(const struct nft_expr *expr,
 	*dst = (*src & priv->mask) ^ priv->xor;
 }
 
+#ifdef CONFIG_SAL_GENERAL
+void nft_cmp_fast_eval(const struct nft_expr *expr,
+			      struct nft_regs *regs)
+#else //Normal
 static void nft_cmp_fast_eval(const struct nft_expr *expr,
 			      struct nft_regs *regs)
+#endif
 {
 	const struct nft_cmp_fast_expr *priv = nft_expr_priv(expr);
 
@@ -228,13 +259,40 @@ indirect_call:
 	expr->ops->eval(expr, regs, pkt);
 }
 
+#ifdef CONFIG_SAL_GENERAL
+
+static unsigned int nft_access_rule(struct nft_rule **rules, struct nft_rule *matched_rule, u32 idx){
+    int swap_count = 0;
+    struct nft_rule *tmp;
+	if (!mrf_enable)
+		return 0;
+
+    //is first
+    if(idx == 0)
+        return 0;
+
+    while(idx != 0){
+        if(rule_compare(&rules[idx-1]->list, &rules[idx]->list)){
+            swap_count++;
+        }else{
+            tmp = rules[idx-1];
+            rules[idx-1] = rules[idx];
+            rules[idx] = tmp;
+        }
+        idx -= 1;
+    }
+    return swap_count+1; // +1 because swap to the head of the list
+
+}
+#endif
+
 unsigned int
 nft_do_chain(struct nft_pktinfo *pkt, void *priv)
 {
-	const struct nft_chain *chain = priv, *basechain = chain;
+	struct nft_chain *chain = priv, *basechain = chain;
 	const struct net *net = nft_net(pkt);
 	struct nft_rule *const *rules;
-	const struct nft_rule *rule;
+	struct nft_rule *rule;
 	const struct nft_expr *expr, *last;
 	struct nft_regs regs;
 	unsigned int stackptr = 0;
@@ -242,21 +300,59 @@ nft_do_chain(struct nft_pktinfo *pkt, void *priv)
 	bool genbit = READ_ONCE(net->nft.gencursor);
 	struct nft_traceinfo info;
 
+    u64 num_expr =0;
+    u32 idx = 0;
+#ifdef CONFIG_SAL_GENERAL
+    int cpu = smp_processor_id();
+    struct per_cpu_rules_t *r;
+    struct nft_rule **rules_backup;
+#endif
+#ifdef CONFIG_SAL_DEBUG
+
+    unsigned int swaps;
+    u64 trav_nodes = 0;
+    info.enabled = false;
+    atomic64_inc(&chain->proc_pkts);
+#endif
+
 	info.trace = false;
 	if (static_branch_unlikely(&nft_trace_enabled))
 		nft_trace_init(&info, pkt, &regs.verdict, basechain);
 do_chain:
+#ifdef CONFIG_SAL_GENERAL
+    //printk("Hooknum: %u\n", pkt->xt.state->hook); //0: prerouting 1: Input 2: forward 3: output 4: postrouting
+    if(pkt->state->hook < 0 || pkt->state->hook > 4){
+        pr_err("Invalid hook\n");
+        return 0;
+    }
+    r = &per_cpu(per_cpu_rules, cpu);
+    //printk("sd: %p\n", sd); //0: prerouting 1: Input 2: forward 3: output 4: postrouting
+
+    rules = rcu_dereference(r->r[pkt->state->hook]);
+    rules_backup = rules;
+    //printk("rules: %p\n", sd->rules[pkt->state->hook]); //0: prerouting 1: Input 2: forward 3: output 4: postrouting
+    if(rules == NULL)
+        return 0;
+#else
 	if (genbit)
 		rules = rcu_dereference(chain->rules_gen_1);
 	else
 		rules = rcu_dereference(chain->rules_gen_0);
+#endif
 
 next_rule:
 	rule = *rules;
 	regs.verdict.code = NFT_CONTINUE;
-	for (; *rules ; rules++) {
+	for (; *rules ; rules++, idx++) {
+#ifdef CONFIG_SAL_DEBUG
+		atomic64_inc(&chain->traversed_rules);
+        trav_nodes++;
+#endif
 		rule = *rules;
 		nft_rule_for_each_expr(expr, last, rule) {
+#ifdef CONFIG_SAL_DEBUG
+            num_expr++;
+#endif
 			if (expr->ops == &nft_cmp_fast_ops)
 				nft_cmp_fast_eval(expr, &regs);
 			else if (expr->ops == &nft_cmp16_fast_ops)
@@ -284,12 +380,39 @@ next_rule:
 	}
 
 	nft_trace_verdict(&info, chain, rule, &regs);
+#ifdef CONFIG_SAL_DEBUG
+    atomic64_add(num_expr, &chain->expr);
+#endif
 
 	switch (regs.verdict.code & NF_VERDICT_MASK) {
 	case NF_ACCEPT:
 	case NF_DROP:
 	case NF_QUEUE:
 	case NF_STOLEN:
+#ifdef CONFIG_SAL_GENERAL
+#ifdef CONFIG_SAL_DEBUG
+        swaps = nft_access_rule(rules_backup, rule, idx);
+        atomic_add(swaps, &chain->swaps);
+        atomic64_add(idx, &chain->traversed_rules);
+        info.enabled = true;
+        info.trav_nodes = trav_nodes;
+        info.swaps = swaps;
+        info.rule_handle = rule->handle;
+
+        info.cpu = cpu;
+
+#else
+        nft_access_rule(rules_backup, rule, idx);
+#endif // CONFIG_SAL_DEBUG
+#else
+#ifdef CONFIG_SAL_DEBUG
+        info.enabled = true;
+        info.trav_nodes = trav_nodes;
+        info.swaps = 0;
+        info.rule_handle = rule->handle;
+        info.cpu = smp_processor_id();
+#endif
+#endif
 		return regs.verdict.code;
 	}
 
@@ -371,6 +494,27 @@ int __init nf_tables_core_module_init(void)
 	}
 
 	nf_skip_indirect_calls_enable();
+#ifdef CONFIG_SAL_GENERAL
+	i = 0;
+	j = 0;
+	for_each_possible_cpu(i) {
+		struct per_cpu_rules_t *r = &per_cpu(per_cpu_rules, i);
+		for(j=0; j < NF_MAX_HOOKS; ++j)
+			r->r[j] = NULL;
+	}
+	mrf_nft_kobj = kobject_create_and_add("mrf_nft_config", kernel_kobj);
+	if (!mrf_nft_kobj)
+		return -ENOMEM;
+
+	err = sysfs_create_file(mrf_nft_kobj, &mrf_enable_attr.attr);
+	if (err) {
+		pr_err("Could not create sysfs entry for nf_tables\n");
+		goto err;
+	}
+	pr_info("MRF nftables is loaded\n");
+#else
+	pr_info("Default nftables is loaded\n");
+#endif
 
 	return 0;
 
@@ -395,4 +539,7 @@ void nf_tables_core_module_exit(void)
 	i = ARRAY_SIZE(nft_basic_objects);
 	while (i-- > 0)
 		nft_unregister_obj(nft_basic_objects[i]);
+#ifdef CONFIG_SAL_GENERAL
+	kobject_put(mrf_nft_kobj);
+#endif
 }

@@ -185,4 +185,19 @@ void nft_objref_map_eval(const struct nft_expr *expr, struct nft_regs *regs,
 struct nft_elem_priv *nft_dynset_new(struct nft_set *set,
 				     const struct nft_expr *expr,
 				     struct nft_regs *regs);
+
+#ifdef CONFIG_SAL_GENERAL
+//taken from cmp.c
+struct nft_cmp_expr {
+	struct nft_data		data;
+	u8			sreg;
+	u8			len;
+	enum nft_cmp_ops	op:8;
+};
+void nft_cmp_fast_eval(const struct nft_expr *expr,struct nft_regs *regs);
+struct per_cpu_rules_t {
+	struct nft_rule *__rcu* r[NF_MAX_HOOKS];
+};
+DECLARE_PER_CPU(struct per_cpu_rules_t, per_cpu_rules);
+#endif
 #endif /* _NET_NF_TABLES_CORE_H */
