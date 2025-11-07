@@ -2267,16 +2267,16 @@ static void nft_chain_stats_replace(struct nft_trans_chain *trans)
 
 static void nf_tables_chain_free_chain_rules(struct nft_chain *chain)
 {
-	struct nft_rule_blob *g0 = rcu_dereference_raw(chain->blob_gen_0);
-	struct nft_rule_blob *g1 = rcu_dereference_raw(chain->blob_gen_1);
+	struct nft_rule **g0 = rcu_dereference_raw(chain->rules_gen_0);
+	struct nft_rule **g1 = rcu_dereference_raw(chain->rules_gen_1);
 
 	if (g0 != g1)
 		kvfree(g1);
 	kvfree(g0);
 
 	/* should be NULL either via abort or via successful commit */
-	WARN_ON_ONCE(chain->blob_next);
-	kvfree(chain->blob_next);
+	WARN_ON_ONCE(chain->rules_next);
+	kvfree(chain->rules_next);
 }
 
 void nf_tables_chain_destroy(struct nft_chain *chain)
@@ -2571,43 +2571,25 @@ static void nft_chain_release_hook(struct nft_chain_hook *hook)
 	module_put(hook->type->owner);
 }
 
-struct nft_rule_dp_last {
-	struct nft_rule_dp end;	/* end of nft_rule_blob marker */
+struct nft_rules_old {
 	struct rcu_head h;
-	struct nft_rule_blob *blob;
-	const struct nft_chain *chain;	/* for tracing */
+	struct nft_rule **start;
 };
 
-static void nft_last_rule(const struct nft_chain *chain, const void *ptr)
+static struct nft_rule **nf_tables_chain_alloc_rules(const struct nft_chain *chain,
+						     unsigned int alloc)
 {
-	struct nft_rule_dp_last *lrule;
-
-	BUILD_BUG_ON(offsetof(struct nft_rule_dp_last, end) != 0);
-
-	lrule = (struct nft_rule_dp_last *)ptr;
-	lrule->end.is_last = 1;
-	lrule->chain = chain;
-	/* blob size does not include the trailer rule */
-}
-
-static struct nft_rule_blob *nf_tables_chain_alloc_rules(const struct nft_chain *chain,
-							 unsigned int size)
-{
-	struct nft_rule_blob *blob;
-
-	if (size > INT_MAX)
+	if (alloc > INT_MAX)
 		return NULL;
 
-	size += sizeof(struct nft_rule_blob) + sizeof(struct nft_rule_dp_last);
-
-	blob = kvmalloc(size, GFP_KERNEL_ACCOUNT);
-	if (!blob)
+	alloc += 1;	/* NULL, ends rules */
+	if (sizeof(struct nft_rule *) > INT_MAX / alloc)
 		return NULL;
 
-	blob->size = 0;
-	nft_last_rule(chain, blob->data);
+	alloc *= sizeof(struct nft_rule *);
+	alloc += sizeof(struct nft_rules_old);
 
-	return blob;
+	return kvmalloc(alloc, GFP_KERNEL);
 }
 
 static void nft_basechain_hook_init(struct nf_hook_ops *ops, u8 family,
@@ -2679,9 +2661,9 @@ static int nf_tables_addchain(struct nft_ctx *ctx, u8 family, u8 policy,
 	struct nft_base_chain *basechain;
 	struct net *net = ctx->net;
 	char name[NFT_NAME_MAXLEN];
-	struct nft_rule_blob *blob;
 	struct nft_trans *trans;
 	struct nft_chain *chain;
+	struct nft_rule **rules;
 	int err;
 
 	if (nla[NFTA_CHAIN_HOOK]) {
@@ -2769,14 +2751,15 @@ static int nf_tables_addchain(struct nft_ctx *ctx, u8 family, u8 policy,
 		chain->udlen = nla_len(nla[NFTA_CHAIN_USERDATA]);
 	}
 
-	blob = nf_tables_chain_alloc_rules(chain, 0);
-	if (!blob) {
+	rules = nf_tables_chain_alloc_rules(chain, 0);
+	if (!rules) {
 		err = -ENOMEM;
 		goto err_destroy_chain;
 	}
 
-	RCU_INIT_POINTER(chain->blob_gen_0, blob);
-	RCU_INIT_POINTER(chain->blob_gen_1, blob);
+	*rules = NULL;
+	rcu_assign_pointer(chain->rules_gen_0, rules);
+	rcu_assign_pointer(chain->rules_gen_1, rules);
 
 	if (!nft_use_inc(&table->use)) {
 		err = -EMFILE;
@@ -10279,77 +10262,32 @@ static bool nft_expr_reduce(struct nft_regs_track *track,
 
 static int nf_tables_commit_chain_prepare(struct net *net, struct nft_chain *chain)
 {
-	const struct nft_expr *expr, *last;
-	struct nft_regs_track track = {};
-	unsigned int size, data_size;
-	void *data, *data_boundary;
-	struct nft_rule_dp *prule;
 	struct nft_rule *rule;
+	unsigned int alloc = 0;
+	int i;
 
 	/* already handled or inactive chain? */
-	if (chain->blob_next || !nft_is_active_next(net, chain))
+	if (chain->rules_next || !nft_is_active_next(net, chain))
 		return 0;
 
-	data_size = 0;
-	list_for_each_entry(rule, &chain->rules, list) {
-		if (nft_is_active_next(net, rule)) {
-			data_size += sizeof(*prule) + rule->dlen;
-			if (data_size > INT_MAX)
-				return -ENOMEM;
-		}
+	rule = list_entry(&chain->rules, struct nft_rule, list);
+	i = 0;
+
+	list_for_each_entry_continue(rule, &chain->rules, list) {
+		if (nft_is_active_next(net, rule))
+			alloc++;
 	}
 
-	chain->blob_next = nf_tables_chain_alloc_rules(chain, data_size);
-	if (!chain->blob_next)
+	chain->rules_next = nf_tables_chain_alloc_rules(chain, alloc);
+	if (!chain->rules_next)
 		return -ENOMEM;
 
-	data = (void *)chain->blob_next->data;
-	data_boundary = data + data_size;
-	size = 0;
-
-	list_for_each_entry(rule, &chain->rules, list) {
-		if (!nft_is_active_next(net, rule))
-			continue;
-
-		prule = (struct nft_rule_dp *)data;
-		data += offsetof(struct nft_rule_dp, data);
-		if (WARN_ON_ONCE(data > data_boundary))
-			return -ENOMEM;
-
-		size = 0;
-		track.last = nft_expr_last(rule);
-		nft_rule_for_each_expr(expr, last, rule) {
-			track.cur = expr;
-
-			if (nft_expr_reduce(&track, expr)) {
-				expr = track.cur;
-				continue;
-			}
-
-			if (WARN_ON_ONCE(data + size + expr->ops->size > data_boundary))
-				return -ENOMEM;
-
-			memcpy(data + size, expr, expr->ops->size);
-			size += expr->ops->size;
-		}
-		if (WARN_ON_ONCE(size >= 1 << 12))
-			return -ENOMEM;
-
-		prule->handle = rule->handle;
-		prule->dlen = size;
-		prule->is_last = 0;
-
-		data += size;
-		size = 0;
-		chain->blob_next->size += (unsigned long)(data - (void *)prule);
+	list_for_each_entry_continue(rule, &chain->rules, list) {
+		if (nft_is_active_next(net, rule))
+			chain->rules_next[i++] = rule;
 	}
 
-	if (WARN_ON_ONCE(data > data_boundary))
-		return -ENOMEM;
-
-	prule = (struct nft_rule_dp *)data;
-	nft_last_rule(chain, prule);
-
+	chain->rules_next[i] = NULL;
 	return 0;
 }
 
@@ -10362,45 +10300,48 @@ static void nf_tables_commit_chain_prepare_cancel(struct net *net)
 		if (trans->msg_type == NFT_MSG_NEWRULE ||
 		    trans->msg_type == NFT_MSG_DELRULE) {
 			struct nft_chain *chain = nft_trans_rule_chain(trans);
-
-			kvfree(chain->blob_next);
-			chain->blob_next = NULL;
+			kvfree(chain->rules_next);
+			chain->rules_next = NULL;
 		}
 	}
 }
 
 static void __nf_tables_commit_chain_free_rules(struct rcu_head *h)
 {
-	struct nft_rule_dp_last *l = container_of(h, struct nft_rule_dp_last, h);
+	struct nft_rules_old *o = container_of(h, struct nft_rules_old, h);
 
-	kvfree(l->blob);
+	kvfree(o->start);
 }
 
-static void nf_tables_commit_chain_free_rules_old(struct nft_rule_blob *blob)
+static void nf_tables_commit_chain_free_rules_old(struct nft_rule **rules)
 {
-	struct nft_rule_dp_last *last;
+	struct nft_rule **r = rules;
+	struct nft_rules_old *old;
 
-	/* last rule trailer is after end marker */
-	last = (void *)blob + sizeof(*blob) + blob->size;
-	last->blob = blob;
+	while (*r)
+		r++;
+
+	r++;	/* rcu_head is after end marker */
+	old = (void *) r;
+	old->start = rules;
 
 	call_rcu(&last->h, __nf_tables_commit_chain_free_rules);
 }
 
 static void nf_tables_commit_chain(struct net *net, struct nft_chain *chain)
 {
-	struct nft_rule_blob *g0, *g1;
+	struct nft_rule **g0, **g1;
 	bool next_genbit;
 
 	next_genbit = nft_gencursor_next(net);
 
-	g0 = rcu_dereference_protected(chain->blob_gen_0,
+	g0 = rcu_dereference_protected(chain->rules_gen_0,
 				       lockdep_commit_lock_is_held(net));
-	g1 = rcu_dereference_protected(chain->blob_gen_1,
+	g1 = rcu_dereference_protected(chain->rules_gen_1,
 				       lockdep_commit_lock_is_held(net));
 
 	/* No changes to this chain? */
-	if (chain->blob_next == NULL) {
+	if (chain->rules_next == NULL) {
 		/* chain had no change in last or next generation */
 		if (g0 == g1)
 			return;
@@ -10409,10 +10350,10 @@ static void nf_tables_commit_chain(struct net *net, struct nft_chain *chain)
 		 * one uses same rules as current generation.
 		 */
 		if (next_genbit) {
-			rcu_assign_pointer(chain->blob_gen_1, g0);
+			rcu_assign_pointer(chain->rules_gen_1, g0);
 			nf_tables_commit_chain_free_rules_old(g1);
 		} else {
-			rcu_assign_pointer(chain->blob_gen_0, g1);
+			rcu_assign_pointer(chain->rules_gen_0, g1);
 			nf_tables_commit_chain_free_rules_old(g0);
 		}
 
@@ -10420,11 +10361,11 @@ static void nf_tables_commit_chain(struct net *net, struct nft_chain *chain)
 	}
 
 	if (next_genbit)
-		rcu_assign_pointer(chain->blob_gen_1, chain->blob_next);
+		rcu_assign_pointer(chain->rules_gen_1, chain->rules_next);
 	else
-		rcu_assign_pointer(chain->blob_gen_0, chain->blob_next);
+		rcu_assign_pointer(chain->rules_gen_0, chain->rules_next);
 
-	chain->blob_next = NULL;
+	chain->rules_next = NULL;
 
 	if (g0 == g1)
 		return;
