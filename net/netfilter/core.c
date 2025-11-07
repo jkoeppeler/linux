@@ -636,10 +636,10 @@ int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
 			if (ret == 1)
 				continue;
 			return ret;
-		case NF_STOLEN:
-			return NF_DROP_GETERR(verdict);
 		default:
-			WARN_ON_ONCE(1);
+			/* Implicit handling for NF_STOLEN, as well as any other
+			 * non conventional verdicts.
+			 */
 			return 0;
 		}
 	}
