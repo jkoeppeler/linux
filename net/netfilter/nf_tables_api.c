@@ -10306,7 +10306,7 @@ static void nf_tables_commit_chain_prepare_cancel(struct net *net)
 	}
 }
 
-static void __nf_tables_commit_chain_free_rules(struct rcu_head *h)
+static void __nf_tables_commit_chain_free_rules_old(struct rcu_head *h)
 {
 	struct nft_rules_old *o = container_of(h, struct nft_rules_old, h);
 
@@ -10325,7 +10325,7 @@ static void nf_tables_commit_chain_free_rules_old(struct nft_rule **rules)
 	old = (void *) r;
 	old->start = rules;
 
-	call_rcu(&last->h, __nf_tables_commit_chain_free_rules);
+	call_rcu(&old->h, __nf_tables_commit_chain_free_rules_old);
 }
 
 static void nf_tables_commit_chain(struct net *net, struct nft_chain *chain)
