@@ -45,7 +45,9 @@ static noinline void __nft_trace_packet(struct nft_traceinfo *info,
 					const struct nft_chain *chain,
 					enum nft_trace_types type)
 {
-	if (!info->trace || !info->nf_trace)
+	const struct nft_pktinfo *pkt = info->pkt;
+
+	if (!info->trace || !pkt->skb->nf_trace)
 		return;
 
 	info->chain = chain;
@@ -60,21 +62,8 @@ static inline void nft_trace_packet(struct nft_traceinfo *info,
 				    enum nft_trace_types type)
 {
 	if (static_branch_unlikely(&nft_trace_enabled)) {
-		const struct nft_pktinfo *pkt = info->pkt;
-
-		info->nf_trace = pkt->skb->nf_trace;
 		info->rule = rule;
 		__nft_trace_packet(info, chain, type);
-	}
-}
-
-static inline void nft_trace_copy_nftrace(struct nft_traceinfo *info)
-{
-	if (static_branch_unlikely(&nft_trace_enabled)) {
-		const struct nft_pktinfo *pkt = info->pkt;
-
-		if (info->trace)
-			info->nf_trace = pkt->skb->nf_trace;
 	}
 }
 
@@ -116,7 +105,6 @@ static noinline void __nft_trace_verdict(struct nft_traceinfo *info,
 					 const struct nft_chain *chain,
 					 const struct nft_regs *regs)
 {
-	const struct nft_pktinfo *pkt = info->pkt;
 	enum nft_trace_types type;
 
 	switch (regs->verdict.code) {
@@ -124,13 +112,8 @@ static noinline void __nft_trace_verdict(struct nft_traceinfo *info,
 	case NFT_RETURN:
 		type = NFT_TRACETYPE_RETURN;
 		break;
-	case NF_STOLEN:
-		type = NFT_TRACETYPE_RULE;
-		/* can't access skb->nf_trace; use copy */
-		break;
 	default:
 		type = NFT_TRACETYPE_RULE;
-		info->nf_trace = pkt->skb->nf_trace;
 		break;
 	}
 
@@ -302,7 +285,6 @@ next_rule:
 		switch (regs.verdict.code) {
 		case NFT_BREAK:
 			regs.verdict.code = NFT_CONTINUE;
-			nft_trace_copy_nftrace(&info);
 			continue;
 		case NFT_CONTINUE:
 			nft_trace_packet(&info, chain, rule,
