@@ -172,10 +172,9 @@ static int nf_trace_fill_pkt_info(struct sk_buff *nlskb,
 
 static int nf_trace_fill_rule_info(struct sk_buff *nlskb,
 				   const struct nft_verdict *verdict,
-				   const struct nft_rule_dp *rule,
 				   const struct nft_traceinfo *info)
 {
-	if (!rule || rule->is_last)
+	if (!info->rule || info->rule->is_last)
 		return 0;
 
 	/* a continue verdict with ->type == RETURN means that this is
@@ -188,7 +187,7 @@ static int nf_trace_fill_rule_info(struct sk_buff *nlskb,
 		return 0;
 
 	return nla_put_be64(nlskb, NFTA_TRACE_RULE_HANDLE,
-			    cpu_to_be64(rule->handle),
+			    cpu_to_be64(info->rule->handle),
 			    NFTA_TRACE_PAD);
 }
 
@@ -214,9 +213,9 @@ static bool nft_trace_have_verdict_chain(const struct nft_verdict *verdict,
 	return true;
 }
 
-static const struct nft_chain *nft_trace_get_chain(const struct nft_rule_dp *rule,
-						   const struct nft_traceinfo *info)
+static const struct nft_chain *nft_trace_get_chain(const struct nft_traceinfo *info)
 {
+	const struct nft_rule_dp *rule = info->rule;
 	const struct nft_rule_dp_last *last;
 
 	if (!rule)
@@ -235,7 +234,6 @@ static const struct nft_chain *nft_trace_get_chain(const struct nft_rule_dp *rul
 
 void nft_trace_notify(const struct nft_pktinfo *pkt,
 		      const struct nft_verdict *verdict,
-		      const struct nft_rule_dp *rule,
 		      struct nft_traceinfo *info)
 {
 	const struct nft_chain *chain;
@@ -248,7 +246,7 @@ void nft_trace_notify(const struct nft_pktinfo *pkt,
 	if (!nfnetlink_has_listeners(nft_net(pkt), NFNLGRP_NFTRACE))
 		return;
 
-	chain = nft_trace_get_chain(rule, info);
+	chain = nft_trace_get_chain(info);
 
 	size = nlmsg_total_size(sizeof(struct nfgenmsg)) +
 		nla_total_size(strlen(chain->table->name)) +
@@ -301,7 +299,7 @@ void nft_trace_notify(const struct nft_pktinfo *pkt,
 	if (nla_put_string(skb, NFTA_TRACE_TABLE, chain->table->name))
 		goto nla_put_failure;
 
-	if (nf_trace_fill_rule_info(skb, verdict, rule, info))
+	if (nf_trace_fill_rule_info(skb, verdict, info))
 		goto nla_put_failure;
 
 	switch (info->type) {
